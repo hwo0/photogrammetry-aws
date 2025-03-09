@@ -1,0 +1,579 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: The AWS CloudFormation template for the photogrammetry processing
+  pipeline in SYD ap-southeast-2
+
+Parameters:
+  Prefix:
+    Type: String
+    Description: The bucket prefix to ensure unique naming of buckets
+  DeploymentBucket:
+    Type: String
+    Description: The name of the bucket where the lambda source code is located
+  CPU:
+    Type: Number
+    Default: 2048
+    Description: The CPU of the Fargate task. Larger image sets may require additional CPU
+  Memory:
+    Type: Number
+    Default: 6144
+    Description: The memory of the Fargate task. Larger image sets may require more memory
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 172.31.0.0/16
+      EnableDnsSupport: 'true'
+      EnableDnsHostnames: 'true'
+  NATGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt ElasticIPAddress.AllocationId
+      SubnetId: !Ref PublicSubnet
+  ElasticIPAddress:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+  ProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${Prefix}-pipeline-processor
+  CompletePollerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${Prefix}-pipeline-completePoller
+  GltfConverterLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${Prefix}-pipeline-gltfConverter
+  IamRoleLambdaExecution:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: !Join
+            - '-'
+            - - pipeline
+              - lambda
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:CreateLogGroup
+                Resource:
+                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${Prefix}-pipeline-*:*
+              - Effect: Allow
+                Action:
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${Prefix}-pipeline-*:*:*
+              - Effect: Allow
+                Action:
+                  - iottwinmaker:CreateScene
+                Resource: !Sub arn:aws:iottwinmaker:${AWS::Region}:${AWS::AccountId}:workspace/${Prefix}-PipelineWorkspace
+              - Effect: Allow
+                Action:
+                  - dynamodb:Scan
+                  - dynamodb:Query
+                  - dynamodb:DeleteItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:PutItem
+                Resource: !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${Prefix}-task-track
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource:
+                  - !Sub arn:aws:s3:::${Prefix}-data-landing
+                  - !Sub arn:aws:s3:::${Prefix}-data-landing/*
+                  - !Sub arn:aws:s3:::${Prefix}-data-processed
+                  - !Sub arn:aws:s3:::${Prefix}-data-processed/*
+                  - !Sub arn:aws:s3:::${Prefix}-data-twinmaker-workspace
+                  - !Sub arn:aws:s3:::${Prefix}-data-twinmaker-workspace/*
+      Path: /
+      RoleName: !Join
+        - '-'
+        - - pipeline
+          - !Sub ${Prefix}
+          - !Ref AWS::Region
+          - lambdaRole
+      ManagedPolicyArns:
+        - !Join
+          - ''
+          - - 'arn:'
+            - !Ref AWS::Partition
+            - ':iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole'
+  ProcessorLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        S3Bucket: !Sub ${DeploymentBucket}
+        S3Key: pipeline.zip
+      Handler: src/processor.handler
+      Runtime: nodejs18.x
+      FunctionName: !Sub ${Prefix}-pipeline-processor
+      MemorySize: 3008
+      Timeout: 900
+      Environment:
+        Variables:
+          LANDING_BUCKET: !Sub ${Prefix}-data-landing
+          PROCESSED_BUCKET: !Sub ${Prefix}-data-processed
+          TASK_TRACK_TABLE: !Sub ${Prefix}-task-track
+          LB_URL: !GetAtt Alb.DNSName
+      Role: !GetAtt IamRoleLambdaExecution.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !GetAtt VPCSecurityGroup.GroupId
+        SubnetIds:
+          - !Ref PrivateSubnet1
+    DependsOn:
+      - ProcessorLogGroup
+  CompletePollerLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        S3Bucket: !Sub ${DeploymentBucket}
+        S3Key: pipeline.zip
+      Handler: src/completePoller.handler
+      Runtime: nodejs18.x
+      FunctionName: !Sub ${Prefix}-pipeline-completePoller
+      MemorySize: 3008
+      Timeout: 900
+      Environment:
+        Variables:
+          LANDING_BUCKET: !Sub ${Prefix}-data-landing
+          PROCESSED_BUCKET: !Sub ${Prefix}-data-processed
+          TASK_TRACK_TABLE: !Sub ${Prefix}-task-track
+          LB_URL: !GetAtt Alb.DNSName
+      Role: !GetAtt IamRoleLambdaExecution.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !GetAtt VPCSecurityGroup.GroupId
+        SubnetIds:
+          - !Ref PrivateSubnet1
+    DependsOn:
+      - CompletePollerLogGroup
+  GltfConverterLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        S3Bucket: !Sub ${DeploymentBucket}
+        S3Key: pipeline.zip
+      Handler: src/gltfConverter.handler
+      Runtime: nodejs18.x
+      FunctionName: !Sub ${Prefix}-pipeline-gltfConverter
+      MemorySize: 3008
+      Timeout: 900
+      Environment:
+        Variables:
+          LANDING_BUCKET: !Sub ${Prefix}-data-landing
+          PROCESSED_BUCKET: !Sub ${Prefix}-data-processed
+          TWINMAKER_WORKSPACE_BUCKET: !Sub ${Prefix}-data-twinmaker-workspace
+          TWINMAKER_WORKSPACE_ID: !Ref TwinMakerWorkspace
+      Role: !GetAtt IamRoleLambdaExecution.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !GetAtt VPCSecurityGroup.GroupId
+        SubnetIds:
+          - !Ref PrivateSubnet1
+    DependsOn:
+      - GltfConverterLogGroup
+  CompletePollerEventsRuleSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: rate(5 minutes)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt CompletePollerLambdaFunction.Arn
+          Id: completePollerSchedule
+  CompletePollerLambdaPermissionEventsRuleSchedule:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt CompletePollerLambdaFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CompletePollerEventsRuleSchedule.Arn
+  S3BucketLandingBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${Prefix}-data-landing
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt ProcessorLambdaFunction.Arn
+      AccelerateConfiguration:
+        AccelerationStatus: Enabled
+    DependsOn:
+      - ProcessorLambdaPermissionLandingBucketS3
+  S3BucketProcessedBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${Prefix}-data-processed
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt GltfConverterLambdaFunction.Arn
+    DependsOn:
+      - GltfConverterLambdaPermissionProcessedBucketS3
+  ProcessorLambdaPermissionLandingBucketS3:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ProcessorLambdaFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Join
+        - ''
+        - - 'arn:'
+          - !Ref AWS::Partition
+          - !Sub ':s3:::${Prefix}-data-landing'
+      SourceAccount: !Ref AWS::AccountId
+  GltfConverterLambdaPermissionProcessedBucketS3:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt GltfConverterLambdaFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Join
+        - ''
+        - - 'arn:'
+          - !Ref AWS::Partition
+          - !Sub ':s3:::${Prefix}-data-processed'
+      SourceAccount: !Ref AWS::AccountId
+  ECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Description: Security group permitting access to internet for DockerHub
+    Properties:
+      GroupDescription: Allow egress to internet, ingress from VPC
+      SecurityGroupIngress:
+        - CidrIp: 172.31.0.0/16
+          Description: Allow ingress from VPC
+          IpProtocol: TCP
+          FromPort: 0
+          ToPort: 65535
+      SecurityGroupEgress:
+        - CidrIp: 0.0.0.0/0
+          Description: Allow egress to internet to access DockerHub
+          IpProtocol: TCP
+          FromPort: 443
+          ToPort: 443
+      VpcId: !Ref VPC
+  VPCSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Description: Security group permitting traffic within VPC
+    Properties:
+      GroupDescription: Allow traffic within the VPC
+      SecurityGroupIngress:
+        - CidrIp: 172.31.0.0/16
+          Description: Allow ingress from VPC
+          IpProtocol: TCP
+          FromPort: 0
+          ToPort: 65535
+      SecurityGroupEgress:
+        - DestinationPrefixListId: pl-62a5400b
+          Description: Allow egress DDB VPC Endpoint
+          IpProtocol: TCP
+          FromPort: 443
+          ToPort: 443
+        - DestinationPrefixListId: pl-6ca54005
+          Description: Allow egress S3 VPC Endpoint
+          IpProtocol: TCP
+          FromPort: 443
+          ToPort: 443
+        - CidrIp: 172.31.0.0/16
+          Description: Allow egress to VPC
+          IpProtocol: TCP
+          FromPort: 0
+          ToPort: 65535
+      VpcId: !Ref VPC
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: ap-southeast-2a
+      CidrBlock: 172.31.128.0/20
+      VpcId: !Ref VPC
+  PublicRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+  RouteToInternet:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZoneId: apse2-az1
+      CidrBlock: 172.31.144.0/20
+      VpcId: !Ref VPC
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZoneId: apse2-az2
+      CidrBlock: 172.31.160.0/20
+      VpcId: !Ref VPC
+  RouteTableAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnet1
+  RouteTableAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnet2
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      # Route traffic through the NAT Gateway:
+      NatGatewayId: !Ref NATGateway
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      VpcId: !Ref VPC
+  DynamoEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.dynamodb
+      VpcId: !Ref VPC
+  LogsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.logs
+      VpcEndpointType: Interface
+      VpcId: !Ref VPC
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref VPCSecurityGroup
+      PrivateDnsEnabled: true
+  TwinMakerAPIEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.iottwinmaker.api
+      VpcEndpointType: Interface
+      VpcId: !Ref VPC
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref VPCSecurityGroup
+      PrivateDnsEnabled: true
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${Prefix}-PipelineFargateCluster
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      ExecutionRoleArn: !GetAtt ECSRole.Arn
+      TaskRoleArn: !GetAtt ECSRole.Arn
+      NetworkMode: awsvpc
+      Cpu: !Sub ${CPU}
+      Memory: !Sub ${Memory}
+      RequiresCompatibilities:
+        - FARGATE
+      ContainerDefinitions:
+        - Name: PipelineTaskDefinition
+          Image: docker.io/opendronemap/nodeodm
+          PortMappings:
+            - ContainerPort: 3000
+              HostPort: 3000
+          Essential: true
+  ECSService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - Listener
+    Properties:
+      LaunchType: FARGATE
+      Cluster: !Ref ECSCluster
+      DesiredCount: 1
+      TaskDefinition: !Ref TaskDefinition
+      DeploymentConfiguration:
+        MaximumPercent: 100
+        MinimumHealthyPercent: 0
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - !GetAtt ECSSecurityGroup.GroupId
+          Subnets:
+            - !Ref PrivateSubnet1
+            - !Ref PrivateSubnet2
+      LoadBalancers:
+        - TargetGroupArn: !Ref TargetGroup
+          ContainerPort: 3000
+          ContainerName: PipelineTaskDefinition
+  Alb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W56
+            reason: Internal load balancer for resource that does not support SSL
+          - id: W52
+            reason: Internal only load balancer without access logging enabled
+    Properties:
+      Name: !Sub ${Prefix}-PipelineAlb
+      Scheme: internal
+      LoadBalancerAttributes:
+        - Key: routing.http.drop_invalid_header_fields.enabled
+          Value: true
+      Subnets:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      Type: application
+      SecurityGroups:
+        - !GetAtt VPCSecurityGroup.GroupId
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${Prefix}-TargetGroup
+      VpcId: !Ref VPC
+      Protocol: HTTP
+      Port: 3000
+      HealthCheckPath: /
+      TargetType: ip
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: !Ref TargetGroup
+          Type: forward
+      LoadBalancerArn: !Ref Alb
+      Port: 3000
+      Protocol: HTTP
+  JobTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${Prefix}-task-track
+      KeySchema:
+        - KeyType: HASH
+          AttributeName: taskId
+      AttributeDefinitions:
+        - AttributeName: taskId
+          AttributeType: S
+      BillingMode: PAY_PER_REQUEST
+  ProcessedBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${Prefix}-data-twinmaker-workspace
+  TwinMakerWorkspace:
+    Type: AWS::IoTTwinMaker::Workspace
+    DependsOn:
+      - ProcessedBucket
+      - TwinMakerRole
+    Properties:
+      Description: PipelineWorkspace
+      Role: !Sub arn:aws:iam::${AWS::AccountId}:role/${Prefix}-twinmakerworkspacerole
+      S3Location: !Sub arn:aws:s3:::${Prefix}-data-twinmaker-workspace
+      WorkspaceId: !Sub ${Prefix}-PipelineWorkspace
+  ECSRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+  TwinMakerRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: F38
+            reason: Grant all resources in pass role
+    Properties:
+      RoleName: !Sub ${Prefix}-twinmakerworkspacerole
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - iottwinmaker.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iottwinmaker:CreateWorkspace
+                  - iottwinmaker:CreateScene
+                  - s3:*Object
+                  - s3:ListBucket
+                  - s3:GetAccountPublicAccessBlock
+                  - s3:GetBucketAcl
+                  - s3:GetBucketLocation
+                  - s3:GetBucketPolicyStatus
+                  - s3:GetBucketPublicAccessBlock
+                  - s3:ListAccessPoints
+                  - s3:ListAllMyBuckets
+                  - lambda:invokeFunction
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: lambda.amazonaws.com
